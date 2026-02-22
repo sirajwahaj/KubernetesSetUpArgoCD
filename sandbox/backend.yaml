@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: ghcr.io/almafrank/backend-guestbook@sha256:9b8996d96e01ea8b69df978460f1eba9d2fd6c784a16f12c273d3912892ed7cb
+        image: ghcr.io/sirajwahaj/ocp-guestbook-backend:sha-1b8b5d1
         imagePullPolicy: Always
         ports:
         - name: http
