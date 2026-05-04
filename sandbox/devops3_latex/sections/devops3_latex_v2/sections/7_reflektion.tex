@@ -1,0 +1,34 @@
+\section{Reflection}
+
+This was the most hands-on assignment I have had in the course so far. Getting something
+to actually run in a real cluster, with real constraints, is very different from following
+a tutorial where everything is set up for you.
+
+The local containerization phase was where I made the most mistakes, but also where I
+learned the most concretely. The architecture mismatch between ARM64 and AMD64 is
+something I would not have run into if I had been on a standard x86 machine, but having
+to debug an \texttt{Illegal Instruction} crash taught me more about how Go cross-compilation
+works than any amount of reading would have. The UBI permission issue was similar. Knowing
+in theory that containers should run as non-root is different from actually seeing the
+permission error, tracing it to \texttt{/app} being root-owned, and finding
+\texttt{/opt/app-root/src} as the right answer. Those kinds of problems leave a stronger
+impression than theory does.
+
+The ArgoCD section was frustrating but valuable. I came in expecting to follow a
+relatively straightforward installation guide and instead spent several sessions debugging
+RBAC errors and discovering the edges of the Sandbox environment. By the end of it I had
+a much clearer picture of what ArgoCD actually needs to operate than I would have gotten
+from a successful install. A tool that works perfectly does not teach you what it depends
+on. A tool that fails in twelve different ways does.
+
+I also came away with a better understanding of why the two-repository pattern exists.
+It felt like extra ceremony at first, maintaining a separate config repo just to store
+YAML files. But once I had the GitHub Actions workflow updating the image tag and could
+see exactly how the code side and the infrastructure side are kept separate, it started
+to make sense. In a team environment where different people have access to different
+systems, that separation is not just organization, it is a security boundary.
+
+If I were to do this again I would spend more time reading the base image documentation
+before writing the first Containerfile. Most of the early errors came from assumptions
+that turned out to be wrong, and the documentation for the Red Hat UBI images is quite
+clear about the non-root conventions once you know to look for it.

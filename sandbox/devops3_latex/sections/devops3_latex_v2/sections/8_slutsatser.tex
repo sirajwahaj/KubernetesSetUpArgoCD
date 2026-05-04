@@ -1,0 +1,21 @@
+\section{Conclusion}
+
+The Guestbook application is running on OpenShift with all four services deployed and
+communicating correctly. The frontend is accessible over HTTPS through an automatically
+assigned Route hostname, the backend connects to both PostgreSQL and Redis, and
+PostgreSQL uses persistent storage so entries survive pod restarts. The container images
+are built automatically by GitHub Actions on every push to main, tagged with the commit
+SHA, scanned for vulnerabilities, and published to GHCR. The infrastructure manifests
+live in a separate repository as the assignment required.
+
+The ArgoCD integration was not completed due to the Sandbox restrictions described in
+section 5. Everything that was needed on the application and infrastructure side is in
+place. The gap is purely a platform permission issue that would not exist on the shared
+cluster or on any cluster where the user has cluster-admin access.
+
+Looking at the project as a whole, I think the main thing it demonstrated is that
+cloud-native deployment is not just about writing the right YAML. A lot of the work is
+understanding the security model of the platform you are deploying to: what users and
+containers are allowed to do, how networking and DNS work, and where secrets should live.
+These are things that are much clearer to me now than they were at the start of the
+assignment.

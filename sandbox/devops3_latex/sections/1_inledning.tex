@@ -1,0 +1,31 @@
+\section{Introduction}
+
+The assignment for this course was to build and deploy a distributed Guestbook application,
+starting from local containerization and working towards a fully automated cloud-native
+deployment on OpenShift. The idea was to go through the whole pipeline myself, from writing
+a Containerfile to pushing images and getting everything running in a real cluster.
+
+The application itself has four parts working together. There is an Nginx-based frontend
+that the user talks to, a Go backend that handles the actual logic, a PostgreSQL database
+for storing guestbook entries, and a Redis cache that sits in front of the database to
+speed up reads. When a user loads the page, the frontend forwards the request to the
+backend, which checks Redis first before hitting PostgreSQL. This setup is a good
+reflection of how real production services are built.
+
+The original plan was to deploy directly to the shared OpenShift cluster at
+\texttt{devops24.cloud2.se}, configure ArgoCD there, and wire everything together with
+GitHub Actions. Part way through the course that changed and we moved to the OpenShift
+Developer Sandbox instead. That shift ended up teaching me more than the original plan
+would have, because the Sandbox has strict platform restrictions that forced me to really
+understand what each piece of the system actually needs to function.
+
+\subsection{Understanding the Repository}
+
+Before writing any Containerfiles I spent time reading through the repository to understand
+what the backend was doing. The backend is written in Go and uses Go modules, so the first
+things I checked were \texttt{go.mod} and \texttt{go.sum} to see what dependencies were
+involved and whether they could be downloaded cleanly. I then ran the backend locally,
+hitting the \texttt{/health}, \texttt{/api/entries}, and \texttt{/api/stats} endpoints
+manually to confirm it behaved as expected. I also checked that the environment variables
+for both PostgreSQL and Redis were being read correctly, since those connections are central
+to everything else working.

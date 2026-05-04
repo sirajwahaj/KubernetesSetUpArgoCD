@@ -1,0 +1,98 @@
+\section{ArgoCD on the OpenShift Developer Sandbox}
+
+The original assignment included setting up ArgoCD to handle GitOps-style deployments,
+where every commit to the infrastructure repository would automatically update what is
+running in the cluster. In the original setup with the shared cluster this would have
+been straightforward. The Sandbox is a different situation.
+
+\subsection{What ArgoCD Needs}
+
+ArgoCD is not a simple application. When it is installed in a cluster it registers
+several cluster-wide Custom Resource Definitions, CRDs, that define new resource types
+like \texttt{Application} and \texttt{AppProject}. It also creates service accounts with
+permissions to read and write resources across the entire cluster, not just one namespace.
+The \texttt{argocd cluster add} CLI command, which registers an external cluster for
+ArgoCD to manage, works by creating a service account in the \texttt{kube-system}
+namespace of the target cluster.
+
+The Sandbox does not allow any of this. Users have access only to their own namespace.
+CRD creation is blocked. RBAC escalation is blocked. The \texttt{kube-system} namespace
+is inaccessible entirely. These are not bugs in the Sandbox but deliberate restrictions
+to prevent one tenant from affecting another.
+
+\subsection{What I Tried}
+
+I went through twelve distinct approaches over several sessions trying to get ArgoCD
+working, or at least partially working. None of them fully succeeded inside the Sandbox,
+but each one taught me something concrete about how ArgoCD and OpenShift work.
+
+The first attempt was to install the OpenShift GitOps Operator through OperatorHub,
+which is the official way to get ArgoCD on an OpenShift cluster. The OperatorHub menu
+is simply not available in the Sandbox, so that path was closed immediately.
+
+The second attempt was to apply the official \texttt{namespace-install.yaml} manifest
+directly. This failed because the manifest tries to create CRDs and escalate RBAC
+privileges, both of which are blocked.
+
+For the third attempt I set up a local Kind cluster on my Mac using Podman as the
+container runtime. This worked after I set the environment variable
+\texttt{KIND\_EXPERIMENTAL\_PROVIDER=podman}, which is needed because Kind defaults to
+Docker. I then installed ArgoCD v3.3.2 into that Kind cluster successfully. Having a
+local ArgoCD instance to work with was useful for the rest of the attempts even though
+it was not the target environment.
+
+Attempts five and six tried to register the Sandbox cluster as a target in my local
+ArgoCD using \texttt{argocd cluster add} with first a cluster-level and then a
+namespace-scoped flag. Both failed for the same reason: the CLI tries to create a
+service account in \texttt{kube-system} on the target cluster regardless of the flags.
+
+Attempts seven and eight tried to work around this by manually creating the
+\texttt{argocd-manager} service account in my own namespace. The first try used admin
+privileges, which RBAC blocked. The second try used edit privileges, which the cluster
+accepted, but edit access to a single namespace is not enough for ArgoCD to perform a
+cluster sync.
+
+Attempt nine created a manual cluster secret in ArgoCD containing my own user token.
+ArgoCD accepted it and the Sandbox cluster showed up in the interface. However when I
+clicked Sync it failed because my user token does not have cluster-scope read
+permissions, only namespace-scope.
+
+Attempt ten tried to use a service account token instead of the user token. Service
+account tokens in OpenShift 4.11 and later are not long-lived by default and have to be
+requested differently than in older versions. The cluster-scope access problem was still
+present regardless.
+
+Attempt eleven applied ArgoCD's own manifests directly inside my Sandbox namespace.
+Several pods came up but others failed due to Security Context Constraints blocking the
+privilege levels that ArgoCD components require.
+
+Attempt twelve tried cross-cluster token sharing between the Kind cluster and the
+Sandbox. Tokens are signed by the cluster that issued them and are not valid on other
+clusters, so this was a dead end.
+
+\subsection{What I Did Achieve}
+
+The application stack itself was fully deployed and working throughout all of this. The
+frontend was reachable over HTTPS through the Route, the backend was connecting to both
+PostgreSQL and Redis, and persistent storage was functioning correctly for PostgreSQL.
+ArgoCD v3.3.2 was installed and running in my local Kind cluster. The Sandbox cluster
+was successfully registered in that ArgoCD instance using a manual cluster secret, which
+is actually a technique used in production multi-cluster setups. The only thing missing
+was the synchronization step, which requires permissions the Sandbox will not grant.
+
+\subsection{What This Exercise Actually Taught Me}
+
+Going through twelve failing attempts was more educational than a clean successful
+install would have been. I now understand exactly which permissions ArgoCD needs and
+why: it has to enumerate resources across the whole cluster to know what state things
+are in, and it has to write to multiple namespaces to apply manifests. A namespace-scoped
+installation simply cannot do the same job.
+
+For anyone who needs GitOps on the Sandbox the practical answer is to use GitHub Actions
+instead. The CI workflow can apply manifests directly with \texttt{oc apply} using a
+token scoped to the project namespace, which is something the Sandbox does permit. It is
+not as elegant as ArgoCD but it works within the constraints of the environment.
+
+If I were doing this on a real cluster, either the shared \texttt{devops24} cluster or
+a managed cloud cluster on EKS, AKS, or GKE, all of these attempts would have
+succeeded. The exercise showed me clearly where the boundaries are.

@@ -1,0 +1,158 @@
+\section{Containerization}
+
+\subsection{Building the Backend Container}
+
+The backend needed a multi-stage Containerfile. The reason for two stages is practical:
+the first stage uses a large Go toolset image to compile the code, and the second stage
+takes only the resulting binary and puts it into a minimal Red Hat UBI image. The final
+image ends up around 94 MB instead of over a gigabyte, which matters for pull times and
+attack surface.
+
+In the build stage I used the Red Hat Golang toolset image and followed the pattern of
+copying \texttt{go.mod} and \texttt{go.sum} first, running \texttt{go mod download}, and
+only then copying the source. This way Docker can cache the dependency layer and skips
+the download step on rebuilds unless the module files change. The binary was built with
+\texttt{CGO\_ENABLED=0} and \texttt{GOOS=linux} so it comes out as a fully static
+binary with no runtime dependencies. The \texttt{-ldflags} and \texttt{-trimpath} flags
+strip debug paths from the binary, which is cleaner for production.
+
+\subsection{Architecture and Permission Challenges}
+
+Several problems came up during the build that were not obvious from the instructions.
+
+The first was a missing lockfile. When I ran the build for the first time it failed with
+\texttt{copier: stat: "/go.sum": no such file or directory}. The repository was new and
+\texttt{go.sum} had never been generated. Running \texttt{go mod tidy} in the
+\texttt{backend/} directory fixed that. It is a small thing but easy to miss if you are
+not used to Go projects.
+
+The second problem was a permission error during the build phase. The error was
+\texttt{open backend: permission denied}. The Red Hat UBI images run as a non-root user
+by default, UID 1001, and that user cannot write to \texttt{/app} which is owned by root.
+The fix was to change \texttt{WORKDIR} to \texttt{/opt/app-root/src}, which is the
+directory that the UBI Go toolset image already prepares for exactly this purpose. I had
+not known that convention before, but it makes sense once you understand that Red Hat
+designs its images to be secure out of the box rather than trusting the developer to add
+security later.
+
+The third issue was an architecture mismatch. My machine is an ARM64 Mac, but the
+original Containerfile had \texttt{GOARCH=amd64} hardcoded. When I ran the resulting
+container I got an \texttt{Illegal Instruction} crash immediately. The binary had been
+compiled for a CPU that the machine did not have. Removing the hardcoded \texttt{GOARCH}
+lets Go detect the host architecture automatically and build a native ARM64 binary, which
+runs without emulation and is noticeably faster.
+
+\subsection{Frontend Container}
+
+The frontend container uses an Nginx base image from Red Hat. One thing I ran into was
+that the container started and then immediately exited with status 0. The reason is that
+the Red Hat Nginx image is designed as a Source-to-Image builder, so without an explicit
+\texttt{CMD} it does not keep the daemon running in the foreground. Adding the following
+line to the Containerfile solved it:
+
+\begin{lstlisting}[language=bash]
+CMD ["nginx", "-g", "daemon off;"]
+\end{lstlisting}
+
+I also needed to make sure the \texttt{nginx.conf} was copied to
+\texttt{/etc/nginx/nginx.conf} so Nginx would pick it up.
+
+\subsection{Nginx as a Reverse Proxy}
+
+Nginx does more than serve the static frontend files. It also proxies API calls from the
+browser to the Go backend. Without this, the browser would try to call
+\texttt{/api/entries} directly on the same host as the frontend, and there would be
+nothing there to answer. The relevant part of \texttt{nginx.conf} looks like this:
+
+\begin{lstlisting}
+location /api/ {
+    proxy_pass http://backend;
+    proxy_set_header Host $host;
+}
+
+location /health {
+    proxy_pass http://backend;
+}
+\end{lstlisting}
+
+The hostname \texttt{backend} works because all containers share the same network.
+Locally that network is created with \texttt{podman network create}, and on OpenShift it
+is handled automatically by the cluster's internal DNS.
+
+\subsection{Local Testing with Podman}
+
+Before moving to OpenShift I tested the full stack locally using Podman. The following
+commands set everything up from scratch:
+
+\begin{lstlisting}[language=bash]
+# Create shared network and data directories
+podman network create guestbook-net || true
+mkdir -p ~/guestbook-data/pgdata ~/guestbook-data/redisdata
+
+# Build both application images
+podman build -t guestbook-backend ./backend
+podman build -t guestbook-frontend ./frontend
+
+# PostgreSQL
+podman run -d --name postgres \
+  --network guestbook-net \
+  -e POSTGRESQL_USER=guestbook \
+  -e POSTGRESQL_PASSWORD=password \
+  -e POSTGRESQL_DATABASE=guestbook \
+  -v ~/guestbook-data/pgdata:/var/lib/pgsql/data:Z \
+  quay.io/fedora/postgresql-16:latest
+
+# Redis
+podman run -d --name redis \
+  --network guestbook-net \
+  -e REDIS_PASSWORD=password \
+  quay.io/kurs/redis:latest
+
+# Backend
+podman run -d --name backend \
+  --network guestbook-net \
+  -e DB_HOST=postgres \
+  -e DB_USER=guestbook \
+  -e DB_PASSWORD=password \
+  -e REDIS_HOST=redis \
+  -e REDIS_PASSWORD=password \
+  localhost/guestbook-backend
+
+# Frontend
+podman run -d --name frontend \
+  --network guestbook-net \
+  -p 8080:8080 \
+  localhost/guestbook-frontend
+\end{lstlisting}
+
+One detail worth noting is the \texttt{:Z} flag on the PostgreSQL volume. On systems
+running SELinux, which includes Fedora and RHEL and therefore the nodes that OpenShift
+runs on, the kernel prevents containers from writing to host directories by default.
+The \texttt{:Z} flag tells Podman to relabel the directory with the correct SELinux
+context. Without it, PostgreSQL crashes with a permission error when it tries to
+initialize its data directory, regardless of which user you are running as.
+
+Another early mistake was forgetting to add \texttt{-p 8080:8080} to the frontend run
+command. The container was running fine internally but nothing was reachable from the
+browser. The fix was straightforward once I understood that port mapping is not automatic.
+
+\subsection{Cache Invalidation in the Backend}
+
+The backend implements a read-through cache. When the frontend requests the list of
+entries, the backend checks Redis first. If the data is there it returns it immediately
+without touching PostgreSQL. If not, it queries PostgreSQL and then stores the result
+in Redis so the next request is fast. The important counterpart to this is what happens
+when someone adds a new entry. If the cached list is not deleted at that point, users
+will see stale data until the cache expires naturally. The relevant code in
+\texttt{main.go} handles this:
+
+\begin{lstlisting}[language=Go]
+// Invalidate cache on write
+if app.Redis != nil {
+    app.Redis.Del(app.Ctx, "entries:all")
+}
+\end{lstlisting}
+
+This is a classic cache invalidation pattern and something I had read about but not
+implemented before. Seeing it break in practice when I accidentally left it out made the
+concept stick much more clearly.

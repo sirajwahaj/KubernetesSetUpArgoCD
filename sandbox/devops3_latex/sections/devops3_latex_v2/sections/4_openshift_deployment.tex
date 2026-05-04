@@ -1,0 +1,222 @@
+\section{Guestbook Deployment to OpenShift}
+
+\subsection{Configuration Management}
+
+Getting the application running locally is one thing. Deploying it to a real cluster
+means thinking carefully about where configuration lives and how secrets are handled.
+The rule I followed throughout was simple: nothing sensitive goes into a container image
+or into a Git repository. Passwords, tokens, and keys belong in Kubernetes Secrets.
+Everything else, hostnames, port numbers, database names, can go into ConfigMaps.
+
+The backend ConfigMap holds the non-sensitive connection details:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+data:
+  DB_HOST: "postgres"
+  DB_PORT: "5432"
+  DB_USER: "guestbook"
+  DB_NAME: "guestbook"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  PORT: "8080"
+\end{lstlisting}
+
+The passwords are kept in a Secret. Secrets are not committed to the repository and
+must be created directly in the cluster before anything else is applied. The quickest
+way to do that is with the imperative command:
+
+\begin{lstlisting}[language=bash]
+oc create secret generic backend-secret \
+  --from-literal=DB_PASSWORD='password' \
+  --from-literal=REDIS_PASSWORD='redispassword'
+\end{lstlisting}
+
+The same pattern applies for PostgreSQL and Redis. Their secrets are created the same
+way before the StatefulSets are applied:
+
+\begin{lstlisting}[language=bash]
+oc create secret generic postgres-secret \
+  --from-literal=POSTGRESQL_PASSWORD='password'
+
+oc create secret generic redis-secret \
+  --from-literal=REDIS_PASSWORD='redispassword'
+\end{lstlisting}
+
+\subsection{Resource Manifests}
+
+\subsubsection{Backend}
+
+The backend is deployed as a standard Deployment with two replicas. It pulls the
+ConfigMap values as a block using \texttt{envFrom} and then adds the password values
+individually from the Secret using \texttt{secretKeyRef}:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/sirajwahaj/ocp-guestbook-backend:sha-1b8b5d1
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: backend-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: DB_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secret
+                  key: REDIS_PASSWORD
+\end{lstlisting}
+
+The Service for the backend is straightforward and just routes traffic on port 8080 to
+whichever pods carry the \texttt{app: backend} label.
+
+\subsubsection{Frontend}
+
+The frontend Deployment is similar but simpler since it does not need any environment
+variables. It is also exposed externally through an OpenShift Route:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: frontend
+spec:
+  to:
+    kind: Service
+    name: frontend
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+\end{lstlisting}
+
+I intentionally left the \texttt{host} field out of the Route. When you set a hardcoded
+hostname that does not match the cluster domain, OpenShift just serves a placeholder
+page and you spend a while wondering why it is not working. Letting OpenShift generate
+the hostname automatically avoids that entirely.
+
+\subsubsection{PostgreSQL}
+
+PostgreSQL is deployed as a StatefulSet because it needs a stable identity and persistent
+storage. A regular Deployment would not guarantee that the same pod gets the same volume
+after a reschedule:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: quay.io/fedora/postgresql-16:latest
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: postgres
+              mountPath: /var/lib/pgsql/data
+          env:
+            - name: POSTGRESQL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRESQL_USER
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRESQL_PASSWORD
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRESQL_DATABASE
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "gp3"
+        resources:
+          requests:
+            storage: 1Gi
+\end{lstlisting}
+
+\subsubsection{Redis}
+
+Redis is also a StatefulSet, but without persistent storage since it only acts as a
+cache. If it restarts and loses its data, the backend will simply fall back to PostgreSQL
+on the next request and repopulate the cache. The manifest is the same structure as
+PostgreSQL but without \texttt{volumeClaimTemplates}.
+
+\subsection{Problems Encountered During Deployment}
+
+\subsubsection{Backend Pods in CrashLoopBackOff}
+
+The backend pods kept restarting when I first applied the manifests. Running
+\texttt{oc logs} showed that the backend was failing to connect to PostgreSQL and Redis,
+which had not finished starting yet. The fix was to make sure the ConfigMaps and Secrets
+existed before applying the Deployment, and to delete the old pods so they could restart
+cleanly with the correct environment variables.
+
+\subsubsection{PostgreSQL Pod Stuck in Pending}
+
+The PostgreSQL pod never moved out of Pending state. The event log showed that the
+StorageClass referenced in the manifest did not exist on this cluster. I had copied a
+manifest that used \texttt{nfs-storage} but the Sandbox uses \texttt{gp3}. Updating
+\texttt{storageClassName} in the \texttt{volumeClaimTemplates} and reapplying fixed it.
+
+\subsubsection{Immutable Fields on StatefulSet}
+
+After changing the StorageClass I tried to apply the updated StatefulSet directly, which
+failed with a forbidden error. Fields like \texttt{volumeClaimTemplates} and
+\texttt{storageClassName} cannot be changed on an existing StatefulSet. The only options
+are to delete the StatefulSet first and then reapply, or to only update fields that are
+allowed to change, like \texttt{replicas} or the container image. I deleted it and
+reapplied, accepting that the persistent volume would also be lost in this case since I
+was still in testing.
+
+\subsubsection{Frontend Not Reachable Externally}
+
+Even after the Route was created the frontend was not reachable from a browser. The
+Route had a hardcoded \texttt{host} field that did not match the cluster domain, so
+requests were reaching the wrong place. Removing that field let OpenShift assign the
+correct hostname automatically. I also added a \texttt{readinessProbe} to the frontend
+Deployment so the Router would not forward traffic until the pod was actually ready to
+serve requests.

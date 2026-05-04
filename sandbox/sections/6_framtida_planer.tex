@@ -1,0 +1,29 @@
+\section{Future Plans}
+
+There are a few things I would do differently or extend if I were to continue working
+on this project.
+
+The most obvious next step is completing the GitOps loop that ArgoCD was supposed to
+close. The infrastructure repository and the GitHub Actions workflow are already in place.
+The cleanest path forward given the Sandbox limitations is to replace the ArgoCD sync
+step with a direct \texttt{oc apply} in the Actions workflow, using a service account
+token scoped to the project namespace. This would give the same end result, a push to
+the application repo triggers a deployment to the cluster automatically, without needing
+cluster-admin access.
+
+For the secrets management I used hardcoded placeholder values throughout this project,
+which is acceptable for a lab environment but would not be acceptable in production. A
+proper solution would use something like HashiCorp Vault or the OpenShift Secrets Store
+CSI Driver, so that credentials are generated, rotated, and injected without any human
+ever handling the actual values.
+
+I would also add health checks and readiness probes to the backend Deployment. I added
+one to the frontend to fix the Route issue, but the backend is currently relying on the
+cluster just waiting long enough for it to be ready. An explicit readiness probe pointing
+at the \texttt{/health} endpoint would make the rollout more reliable, especially when
+the backend is waiting for PostgreSQL to become available.
+
+On the monitoring side, the application has no observability beyond the basic container
+logs. Adding a metrics endpoint and connecting it to the built-in OpenShift monitoring
+stack would make it much easier to understand how the application is behaving in
+production.

@@ -1,0 +1,125 @@
+\section{GitHub Actions Workflow}
+
+With the containers working locally, the next step was to automate the build and push
+process. I set up a GitHub Actions workflow so that I never have to run
+\texttt{podman build} manually again. The workflow is defined in
+\texttt{.github/workflows/ci.yml} and covers testing, building multi-architecture
+images, scanning for vulnerabilities, and sending a notification when it is done.
+
+\subsection{Triggers}
+
+The workflow runs on two events: a \texttt{workflow\_dispatch}, which lets me trigger it
+manually from the GitHub UI, and any pull request targeting the main branch. I chose not
+to trigger it on every push to main. The idea is that the pipeline validates a pull
+request before it is merged, and I can also kick it off by hand whenever needed.
+
+\subsection{Job 1: Backend Tests}
+
+The first job checks out the code, installs Go 1.24 with dependency caching pointed at
+\texttt{backend/go.sum}, and runs \texttt{make test} inside the \texttt{backend/}
+directory. If the tests fail the rest of the pipeline stops. There is no point building
+and pushing a container image if the code inside it is already broken.
+
+\subsection{Job 2: Build and Push}
+
+The build job uses a matrix strategy so it runs once for the backend and once for the
+frontend in parallel, rather than having to write two separate near-identical jobs:
+
+\begin{lstlisting}[language=yaml]
+strategy:
+  matrix:
+    component: [backend, frontend]
+\end{lstlisting}
+
+Inside the job I set up QEMU and Docker Buildx to enable cross-platform builds. The
+images are built for both \texttt{linux/amd64} and \texttt{linux/arm64} so they work on
+standard cloud servers as well as on my ARM64 Mac when testing locally.
+
+For tagging I used \texttt{docker/metadata-action} rather than constructing tags by
+hand. It generates three tags automatically: one based on the commit SHA
+(\texttt{sha-xxxxxxx}), one based on the branch name, and \texttt{latest} when the
+build is on the default branch:
+
+\begin{lstlisting}[language=yaml]
+tags: |
+  type=sha
+  type=ref,event=branch
+  type=raw,value=latest,enable={{is_default_branch}}
+\end{lstlisting}
+
+The SHA tag is the most useful in practice because it ties every image back to an exact
+commit, which makes debugging a bad deployment much easier. Images are only pushed when
+the event is not a pull request, so branches that have not been reviewed do not pollute
+GHCR with unfinished work.
+
+After the push, the job runs Trivy to scan the published image. I configured it to exit
+with a failure code if it finds \texttt{CRITICAL} or \texttt{HIGH} severity issues that
+have a fix available. Unfixed vulnerabilities are ignored since there is nothing I can
+act on immediately:
+
+\begin{lstlisting}[language=yaml]
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: >-
+      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}:latest
+    format: "table"
+    exit-code: "1"
+    ignore-unfixed: true
+    vuln-type: "os,library"
+    severity: "CRITICAL,HIGH"
+\end{lstlisting}
+
+\subsection{Job 3: Discord Notification}
+
+The last job runs after both the test and build jobs have finished, regardless of whether
+they succeeded or failed, using \texttt{if: always()}. It sends a message to a Discord
+channel with the overall build status, the repository name, the event that triggered the
+run, and a direct link to the workflow on GitHub. The webhook credentials are stored as
+repository secrets.
+
+This turned out to be more useful than I expected. Instead of having to check GitHub
+constantly, I get a notification in Discord the moment a build completes, and the status
+line tells me immediately whether it passed or failed.
+
+\subsection{One Problem with Actions}
+
+One error I ran into early was a confusing one. The workflow failed with:
+
+\begin{lstlisting}
+Error: Unable to resolve action actions/setup-buildx-action,
+repository not found.
+\end{lstlisting}
+
+I had assumed all the standard actions were under the \texttt{actions/} namespace, the
+same as \texttt{actions/checkout} and \texttt{actions/setup-go}. It turned out that the
+Buildx and QEMU actions are maintained by Docker and live under the \texttt{docker/}
+namespace. The fix was to change the paths to \texttt{docker/setup-qemu-action} and
+\texttt{docker/setup-buildx-action}. It is the kind of mistake you only make once.
+
+\subsection{What the Pipeline Does Not Do Yet}
+
+The current workflow does not automatically update the infrastructure repository with the
+new image tag, which is the step that would close the GitOps loop and let ArgoCD pick
+up new versions on its own. That requires a separate job that checks out the config
+repo, uses \texttt{yq} to patch the image reference in the deployment manifest, and
+pushes the commit using a personal access token. I built and tested this in a separate
+branch during the ArgoCD work described in section 5, but kept it out of the main
+workflow since the ArgoCD integration itself could not be completed on the Sandbox. The
+wiring is there and ready; it just needs the right cluster environment to be worth
+enabling.
+
+\subsection{Two Repositories and Why}
+
+The application code and the OpenShift manifests live in separate Git repositories. The
+application repo contains the source code, Containerfiles, and this CI workflow. The
+config repo contains only the Kubernetes YAML files under a \texttt{k8s/} directory.
+This follows the GitOps principle that the desired state of the infrastructure should be
+its own versioned artifact, separate from the application that runs in it.
+
+The reason I find most compelling is access control. I can give someone access to the
+application repo without giving them any ability to change what is deployed to the
+cluster. Changes to the cluster go through the config repo, which can have its own
+review process. There is also a clean audit trail: if something breaks in production,
+the config repo's commit history shows exactly what changed and when, independently of
+any application code changes happening at the same time.

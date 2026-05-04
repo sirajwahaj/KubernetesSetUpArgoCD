@@ -1,0 +1,68 @@
+\section{GitHub Actions Workflow}
+
+With the containers working locally, the next step was to automate the whole build and
+push process using GitHub Actions. The idea is that nobody should have to run
+\texttt{podman build} manually. Every time code is pushed to the main branch, the
+pipeline should handle testing, building, scanning, and publishing the images on its own.
+
+\subsection{Pipeline Structure}
+
+The workflow is triggered on every push or pull request to main. I enabled concurrency
+so that if a new push comes in while a run is still going, the old run gets cancelled.
+Without this, two deployments can race against each other and produce inconsistent state.
+
+The first job runs the backend tests. It checks out the repository, installs the right
+version of Go with caching enabled, and runs \texttt{go test}. If the tests fail, the
+rest of the pipeline does not run. This was an important thing to get right early,
+because it is easy to build and push a broken image if you do not gate on tests first.
+
+The second job builds the container images and pushes them to GHCR. I set up QEMU and
+Docker Buildx so the images come out as multi-architecture, supporting both
+\texttt{linux/amd64} and \texttt{linux/arm64}. Each image is tagged with the Git commit
+SHA and the run number rather than \texttt{latest}, so every build is traceable.
+Using \texttt{latest} for production images is a bad habit because you lose the ability
+to know exactly what code is running. I configured the job to skip pushing on pull
+requests, so images are only published when code is actually merged. I also added Trivy
+scanning to catch critical and high-severity vulnerabilities before anything gets
+deployed.
+
+The third job updates the infrastructure repository with the new image tag. It checks
+out the \texttt{guestbook-config} repo, uses \texttt{yq} to patch the image tag in the
+deployment manifest, and pushes the change. This is the GitOps handoff point: the
+application repo knows how to build, and the infrastructure repo records what version
+is running. A GitHub token with write access to the config repo is required for this step.
+
+The last job sends a build notification to Discord with the result, the version that was
+built, and a link to the workflow run. This is a small addition but it makes it much
+easier to know when something has deployed or broken without having to open the GitHub
+UI.
+
+\subsection{One Problem with Actions}
+
+One error I ran into early was a confusing one. The workflow failed with:
+
+\begin{lstlisting}
+Error: Unable to resolve action actions/setup-buildx-action,
+repository not found.
+\end{lstlisting}
+
+I had assumed all the standard actions were under the \texttt{actions/} namespace,
+the same as \texttt{actions/checkout} and \texttt{actions/setup-go}. It turned out that
+the Buildx and QEMU actions are maintained by Docker and live under the \texttt{docker/}
+namespace. The fix was simply to change the paths to
+\texttt{docker/setup-qemu-action} and \texttt{docker/setup-buildx-action}. It is the
+kind of mistake you only make once.
+
+\subsection{Two Repositories and Why}
+
+At this point the project was split into two separate Git repositories. One holds the
+application source code, Containerfiles, and the CI workflow. The other holds only the
+Kubernetes and OpenShift manifest files. This separation follows a principle called
+GitOps, where the desired state of the infrastructure is stored in Git and a tool like
+ArgoCD keeps the cluster in sync with it.
+
+The practical reason for having two repos is access control. A developer working on the
+application code does not need cluster credentials. The CI workflow updates the config
+repo with a new image tag, and ArgoCD picks that up and handles the deployment. There
+is also a clean audit trail: if something breaks in production, you can look at the
+commit history of the config repo and see exactly what changed and when.
